@@ -74,11 +74,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg.type === "NETLOG_SET_ENABLED") {
     netlogSetEnabled(msg.enabled);
-    chrome.tabs.query({ url: ["*://*.xiaohongshu.com/*"] }, (tabs) => {
-      for (const t of tabs) {
-        chrome.tabs.sendMessage(t.id, { type: "NETLOG_ENABLED_CHANGED", enabled: msg.enabled }).catch(() => {});
-      }
-    });
     sendResponse({ ok: true, enabled: netlogIsEnabled() });
     return true;
   }

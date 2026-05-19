@@ -172,6 +172,9 @@ titleEl?.addEventListener("click", () => {
   _netlogHitTimer = setTimeout(() => { _netlogHits = 0; }, NETLOG_HIT_RESET_MS);
   if (_netlogHits >= NETLOG_HIT_TARGET) {
     _netlogHits = 0;
+    titleEl.style.transition = "background 0.2s";
+    titleEl.style.background = "#fef9e7";
+    setTimeout(() => { titleEl.style.background = ""; }, 300);
     chrome.runtime.sendMessage({ type: "NETLOG_GET_ENABLED" }, (resp) => {
       if (resp?.enabled) {
         if (confirm("关闭 NetLog?")) toggleNetlog(false);
@@ -272,6 +275,8 @@ function showNetlogDetail(entry) {
   if (!el) return;
   el.style.display = "block";
   el.textContent = JSON.stringify(entry, null, 2);
+  el.onclick = () => { el.style.display = "none"; };
+  el.title = "点击此处关闭详情";
 }
 
 function renderNetlogCategory(container) {
@@ -295,9 +300,11 @@ function renderNetlogCategory(container) {
         ${items.map((e, i) => {
           const path = e.path.length > 60 ? e.path.slice(0, 57) + "…" : e.path;
           const signal = (e.signals || []).slice(0, 2).join(", ");
-          return `<div class="netlog-row cat-${e.category}" data-cat="${cat}" data-idx="${i}">
-            ${e.tsLabel}  ${e.method.padEnd(4)} ${e.status || "?"}  ${e.host.replace(/^www\./, "")}${path}${signal ? "  ["+signal+"]" : ""}
-          </div>`;
+          const signalSuffix = signal ? "  [" + signal + "]" : "";
+          const hostShort = e.host.replace(/^www\./, "");
+          return `<div class="netlog-row cat-${e.category}" data-cat="${cat}" data-idx="${i}">` +
+                 `${e.tsLabel}  ${e.method.padEnd(4)} ${e.status || "?"}  ` +
+                 `${hostShort}${path}${signalSuffix}</div>`;
         }).join("")}
       </details>
     `);

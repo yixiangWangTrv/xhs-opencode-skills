@@ -237,17 +237,3 @@ window.addEventListener("message", (e) => {
   }
 });
 
-// 启动时同步 netlog 启用状态到 MAIN world
-function _syncNetlogStatus() {
-  chrome.runtime.sendMessage({ type: "NETLOG_GET_ENABLED" }, (resp) => {
-    window.postMessage({ source: "xhs-netlog-status", enabled: !!resp?.enabled }, "*");
-  });
-}
-_syncNetlogStatus();
-
-// 监听 background 推送的启用状态变化
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === "NETLOG_ENABLED_CHANGED") {
-    window.postMessage({ source: "xhs-netlog-status", enabled: !!msg.enabled }, "*");
-  }
-});

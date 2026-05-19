@@ -19,16 +19,7 @@
   const BLOCKED = new Set([404, 461, 403, 999]);
   const XHS_API = /xiaohongshu\.com\/api\//;
 
-  let _netlogEnabled = false;
   const RESP_BODY_MAX = 4096;
-
-  // 通过 storage 同步 netlog 启用状态（MAIN world 不能直接读 chrome.storage）
-  // content.js 监听 storage.local 变化，postMessage 给我们
-  window.addEventListener("message", (e) => {
-    if (e.data?.source === "xhs-netlog-status") {
-      _netlogEnabled = !!e.data.enabled;
-    }
-  });
 
   // ── Cookie 快照 ──────────────────────────────────────────────
 
@@ -303,8 +294,8 @@
       emit(buildEvent(url, method, resp.status, headers, { intercept_type: "fetch" }));
     }
 
-    // NetLog 全量记录（仅启用时）
-    if (_netlogEnabled && url.includes("xiaohongshu.com")) {
+    // NetLog 全量记录（background 单点过滤 _netEnabled）
+    if (url.includes("xiaohongshu.com")) {
       let respBody = null;
       try {
         const clone = resp.clone();
@@ -355,8 +346,8 @@
         }));
       }
 
-      // NetLog 全量记录
-      if (_netlogEnabled && url.includes("xiaohongshu.com")) {
+      // NetLog 全量记录（background 单点过滤 _netEnabled）
+      if (url.includes("xiaohongshu.com")) {
         let respBody = null;
         try {
           const t = this.responseText || "";

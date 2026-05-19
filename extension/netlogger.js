@@ -76,8 +76,6 @@ const NETLOG_RESP_HEADER_WHITELIST = new Set([
   "content-type", "server", "x-application-context",
 ]);
 
-const NETLOG_COOKIE_KEYS = ["a1", "web_session", "webId", "gid"];
-
 const NETLOG_SKIP_TYPES = new Set(["image", "font", "stylesheet", "media"]);
 
 function _filterHeaders(rawHeaders, whitelist) {
@@ -251,9 +249,9 @@ chrome.webRequest.onHeadersReceived.addListener(
 // ─── Step 3.5: onCompleted + onErrorOccurred（finalize 入栈） ─────────────────
 
 function _netlogFinalize(details, isError) {
-  if (!_netEnabled) return;
   const entry = _netPending.get(details.requestId);
   _netPending.delete(details.requestId);
+  if (!_netEnabled) return;
   if (!entry) return;
   entry.duration_ms = Date.now() - entry._t0;
   delete entry._t0;
@@ -266,7 +264,14 @@ function _netlogFinalize(details, isError) {
   entry.cookieDiff = _netlogComputeCookieDiff(entry);
   if (entry.cookieDiff) {
     entry.category = entry.category === "other" ? "cookie_change" : entry.category;
-    entry.signals.push("set_cookie_changed:" + entry.cookieDiff.added.join(","));
+    const diffParts = [];
+    if (entry.cookieDiff.added.length) {
+      diffParts.push("added:" + entry.cookieDiff.added.join(","));
+    }
+    if (entry.cookieDiff.removed.length) {
+      diffParts.push("removed:" + entry.cookieDiff.removed.join(","));
+    }
+    entry.signals.push("set_cookie_changed:" + diffParts.join(";"));
   }
 
   _netlogPush(entry);
@@ -292,7 +297,7 @@ function netlogIngestInterceptor(payload) {
   for (let i = _netBuffer.length - 1; i >= 0; i--) {
     const e = _netBuffer[i];
     if (payload.ts - e.ts > NETLOG_INTERCEPTOR_WINDOW_MS) break;
-    if (e.method === payload.method && e.url === payload.url && !e.respBody) {
+    if (e.method === payload.method && _netlogUrlMatch(e.url, payload.url) && !e.respBody) {
       e.respBody = payload.respBody;
       // 合并 interceptor 头（webRequest 拿不到的应用层头）
       for (const [k, v] of Object.entries(payload.reqHeaders || {})) {
@@ -315,7 +320,7 @@ function netlogIngestInterceptor(payload) {
     path: (() => { try { const u = new URL(payload.url); return u.pathname + (u.search || ""); } catch (_) { return payload.url; } })(),
     resourceType: "xmlhttprequest",
     tabId: -1,
-    reqHeaders: payload.reqHeaders || {},
+    reqHeaders: {},
     reqBody: null,
     reqFingerprint: null,
     status: payload.status,
@@ -332,6 +337,13 @@ function netlogIngestInterceptor(payload) {
     errorCode: null,
     _orphan: true,
   };
+  // 过白名单（与 webRequest 路径保持一致）
+  for (const [k, v] of Object.entries(payload.reqHeaders || {})) {
+    const lk = k.toLowerCase();
+    if (NETLOG_REQ_HEADER_WHITELIST.has(lk)) {
+      orphanEntry.reqHeaders[lk] = v;
+    }
+  }
   // orphan 也跑分类
   const { category, signals } = _netlogClassify(orphanEntry);
   orphanEntry.category = category;
@@ -368,7 +380,7 @@ function _netlogClassify(entry) {
     signals.push("fingerprint_upload");
     if (fpBodyHit) signals.push(`body_contains:${fpBodyHit}`);
   } else if (entry.setCookie && entry.setCookie.length > 0) {
-    // cookie_change 由 cookieDiff 进一步判断（见下）
+    // 阻断：带 Set-Cookie 的请求不归 page_nav/business_api，留给 _netlogFinalize 中的 cookieDiff 二阶段升级为 cookie_change
     category = "other";
   } else if (entry.resourceType === "main_frame") {
     category = "page_nav";
@@ -377,6 +389,24 @@ function _netlogClassify(entry) {
   }
 
   return { category, signals };
+}
+
+function _netlogUrlMatch(webRequestUrl, interceptorUrl) {
+  if (webRequestUrl === interceptorUrl) return true;
+  // interceptor 可能拿到相对路径 (fetch("/api/foo")) 或绝对路径
+  // webRequest 总是绝对路径
+  if (interceptorUrl.startsWith("/")) {
+    try {
+      return new URL(webRequestUrl).pathname + new URL(webRequestUrl).search
+             === interceptorUrl.split("#")[0];
+    } catch (_) { return false; }
+  }
+  // 都是绝对路径但有 query 顺序差异
+  try {
+    const a = new URL(webRequestUrl);
+    const b = new URL(interceptorUrl);
+    return a.host === b.host && a.pathname === b.pathname;
+  } catch (_) { return false; }
 }
 
 function _netlogComputeCookieDiff(entry) {
