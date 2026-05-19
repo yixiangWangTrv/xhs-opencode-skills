@@ -61,3 +61,212 @@ function _netlogPush(entry) {
   // 通知 popup 增量
   chrome.runtime.sendMessage({ type: "NETLOG_ENTRY_ADDED", entry }).catch(() => {});
 }
+
+// ─── Step 3.1: header 白名单 + cookie 工具 ───────────────────────────────────
+
+const NETLOG_REQ_HEADER_WHITELIST = new Set([
+  "xs", "xt", "x-s-common", "x-t", "x-mns-platform",
+  "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user",
+  "referer", "origin", "user-agent",
+  "content-type", "accept", "accept-language",
+]);
+
+const NETLOG_RESP_HEADER_WHITELIST = new Set([
+  "location", "set-cookie", "cache-control", "x-request-id",
+  "content-type", "server", "x-application-context",
+]);
+
+const NETLOG_COOKIE_KEYS = ["a1", "web_session", "webId", "gid"];
+
+const NETLOG_SKIP_TYPES = new Set(["image", "font", "stylesheet", "media"]);
+
+function _filterHeaders(rawHeaders, whitelist) {
+  const out = {};
+  if (!rawHeaders) return out;
+  for (const h of rawHeaders) {
+    const k = h.name.toLowerCase();
+    if (whitelist.has(k)) {
+      // set-cookie 可能多个值，累加
+      if (k === "set-cookie" && out[k]) out[k] += "\n" + h.value;
+      else out[k] = h.value;
+    }
+  }
+  return out;
+}
+
+function _parseCookieHeader(cookieStr) {
+  const map = {};
+  if (!cookieStr) return map;
+  for (const part of cookieStr.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    map[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return map;
+}
+
+function _extractReqBody(requestBody) {
+  if (!requestBody) return null;
+  if (requestBody.raw && requestBody.raw[0] && requestBody.raw[0].bytes) {
+    try {
+      return new TextDecoder().decode(requestBody.raw[0].bytes).slice(0, NETLOG_REQBODY_MAX);
+    } catch (_) {
+      return "[binary " + requestBody.raw[0].bytes.byteLength + "B]";
+    }
+  }
+  if (requestBody.formData) {
+    try {
+      return JSON.stringify(requestBody.formData).slice(0, NETLOG_REQBODY_MAX);
+    } catch (_) { return "[formData]"; }
+  }
+  return null;
+}
+
+function _tsLabel(ts) {
+  const d = new Date(ts);
+  return String(d.getHours()).padStart(2, "0") + ":" +
+         String(d.getMinutes()).padStart(2, "0") + ":" +
+         String(d.getSeconds()).padStart(2, "0") + "." +
+         String(d.getMilliseconds()).padStart(3, "0");
+}
+
+// ─── Step 3.2: onBeforeRequest（拿 reqBody bytes） ────────────────────────────
+
+const NETLOG_URL_FILTER = {
+  urls: ["<all_urls>"],
+};
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    if (!_netEnabled) return;
+    if (NETLOG_SKIP_TYPES.has(details.type)) return;
+
+    let host = "";
+    try { host = new URL(details.url).host; } catch (_) {}
+
+    _netPending.set(details.requestId, {
+      id: `${details.timeStamp}_${details.requestId}`,
+      requestId: details.requestId,
+      ts: details.timeStamp,
+      tsLabel: _tsLabel(details.timeStamp),
+      method: details.method,
+      url: details.url,
+      host,
+      path: (() => { try { const u = new URL(details.url); return u.pathname + (u.search || ""); } catch (_) { return details.url; } })(),
+      resourceType: details.type,
+      tabId: details.tabId,
+      reqHeaders: {},
+      reqBody: _extractReqBody(details.requestBody),
+      reqFingerprint: null,
+      status: 0,
+      statusLine: "",
+      respHeaders: {},
+      respBody: null,
+      setCookie: null,
+      duration_ms: 0,
+      err: null,
+      category: "other",
+      signals: [],
+      cookieDiff: null,
+      redirectTo: null,
+      errorCode: null,
+      _t0: Date.now(),
+    });
+  },
+  NETLOG_URL_FILTER,
+  ["requestBody"],
+);
+
+// ─── Step 3.3: onSendHeaders（拿请求头 + cookie 指纹） ────────────────────────
+
+chrome.webRequest.onSendHeaders.addListener(
+  (details) => {
+    if (!_netEnabled) return;
+    const entry = _netPending.get(details.requestId);
+    if (!entry) return;
+
+    entry.reqHeaders = _filterHeaders(details.requestHeaders, NETLOG_REQ_HEADER_WHITELIST);
+
+    const cookieStr = (details.requestHeaders || []).find(h => h.name.toLowerCase() === "cookie")?.value || "";
+    const cookieMap = _parseCookieHeader(cookieStr);
+    const ua = entry.reqHeaders["user-agent"] || "";
+    entry.reqFingerprint = {
+      has_xs:        !!entry.reqHeaders["xs"],
+      has_xt:        !!entry.reqHeaders["xt"],
+      has_xsCommon:  !!entry.reqHeaders["x-s-common"],
+      sec_fetch_site: entry.reqHeaders["sec-fetch-site"] || null,
+      sec_fetch_mode: entry.reqHeaders["sec-fetch-mode"] || null,
+      referer:        entry.reqHeaders["referer"] || null,
+      origin:         entry.reqHeaders["origin"] || null,
+      ua_prefix:      ua.slice(0, 80),
+      cookie: {
+        has_a1:              "a1" in cookieMap,
+        has_web_session:     "web_session" in cookieMap,
+        has_webId:           "webId" in cookieMap,
+        has_gid:             "gid" in cookieMap,
+        a1_preview:          cookieMap["a1"]          ? cookieMap["a1"].slice(0, 12)          + "…" : null,
+        web_session_preview: cookieMap["web_session"] ? cookieMap["web_session"].slice(0, 10) + "…" : null,
+      },
+    };
+  },
+  NETLOG_URL_FILTER,
+  ["requestHeaders", "extraHeaders"],
+);
+
+// ─── Step 3.4: onHeadersReceived（拿响应头 / 状态 / set-cookie） ──────────────
+
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    if (!_netEnabled) return;
+    const entry = _netPending.get(details.requestId);
+    if (!entry) return;
+
+    entry.status = details.statusCode;
+    entry.statusLine = (details.statusLine || "").replace(/^HTTP\/[\d.]+\s*/, "");
+    entry.respHeaders = _filterHeaders(details.responseHeaders, NETLOG_RESP_HEADER_WHITELIST);
+
+    if (entry.respHeaders["set-cookie"]) {
+      entry.setCookie = entry.respHeaders["set-cookie"]
+        .split("\n")
+        .map(s => {
+          const i = s.indexOf("=");
+          return i > 0 ? s.slice(0, i).trim() : s.trim();
+        });
+    }
+
+    if (details.statusCode === 301 || details.statusCode === 302) {
+      entry.redirectTo = entry.respHeaders["location"] || null;
+      if (entry.redirectTo) {
+        try {
+          const loc = new URL(entry.redirectTo, details.url);
+          entry.errorCode = loc.searchParams.get("error_code");
+        } catch (_) {}
+      }
+    }
+  },
+  NETLOG_URL_FILTER,
+  ["responseHeaders", "extraHeaders"],
+);
+
+// ─── Step 3.5: onCompleted + onErrorOccurred（finalize 入栈） ─────────────────
+
+function _netlogFinalize(details, isError) {
+  if (!_netEnabled) return;
+  const entry = _netPending.get(details.requestId);
+  _netPending.delete(details.requestId);
+  if (!entry) return;
+  entry.duration_ms = Date.now() - entry._t0;
+  delete entry._t0;
+  if (isError) entry.err = details.error || "network_error";
+  // 分类逻辑由后续 task 5 接入
+  _netlogPush(entry);
+}
+
+chrome.webRequest.onCompleted.addListener(
+  (d) => _netlogFinalize(d, false),
+  NETLOG_URL_FILTER,
+);
+chrome.webRequest.onErrorOccurred.addListener(
+  (d) => _netlogFinalize(d, true),
+  NETLOG_URL_FILTER,
+);
