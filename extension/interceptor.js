@@ -19,6 +19,17 @@
   const BLOCKED = new Set([404, 461, 403, 999]);
   const XHS_API = /xiaohongshu\.com\/api\//;
 
+  let _netlogEnabled = false;
+  const RESP_BODY_MAX = 4096;
+
+  // 通过 storage 同步 netlog 启用状态（MAIN world 不能直接读 chrome.storage）
+  // content.js 监听 storage.local 变化，postMessage 给我们
+  window.addEventListener("message", (e) => {
+    if (e.data?.source === "xhs-netlog-status") {
+      _netlogEnabled = !!e.data.enabled;
+    }
+  });
+
   // ── Cookie 快照 ──────────────────────────────────────────────
 
   function captureCookies() {
@@ -287,9 +298,31 @@
 
     const resp = await _fetch.call(this, input, init);
 
+    // 现有 BLOCKED 诊断保持不变
     if (BLOCKED.has(resp.status) && (isApiUrl(url) || url.includes("xiaohongshu.com"))) {
       emit(buildEvent(url, method, resp.status, headers, { intercept_type: "fetch" }));
     }
+
+    // NetLog 全量记录（仅启用时）
+    if (_netlogEnabled && url.includes("xiaohongshu.com")) {
+      let respBody = null;
+      try {
+        const clone = resp.clone();
+        const text = await clone.text();
+        respBody = text.length > RESP_BODY_MAX ? text.slice(0, RESP_BODY_MAX) + "…[cut]" : text;
+      } catch (_) { respBody = "[unreadable]"; }
+
+      window.postMessage({
+        source: "xhs-netlog-intercept",
+        method,
+        url,
+        status: resp.status,
+        reqHeaders: headers,
+        respBody,
+        ts: Date.now(),
+      }, "*");
+    }
+
     return resp;
   };
 
@@ -314,10 +347,31 @@
   XMLHttpRequest.prototype.send = function () {
     this.addEventListener("loadend", () => {
       const url = this.__i_url || "";
+
+      // 现有 BLOCKED 诊断保持不变
       if (BLOCKED.has(this.status) && (isApiUrl(url) || url.includes("xiaohongshu.com"))) {
         emit(buildEvent(url, this.__i_method || "GET", this.status, this.__i_headers || {}, {
           intercept_type: "xhr",
         }));
+      }
+
+      // NetLog 全量记录
+      if (_netlogEnabled && url.includes("xiaohongshu.com")) {
+        let respBody = null;
+        try {
+          const t = this.responseText || "";
+          respBody = t.length > RESP_BODY_MAX ? t.slice(0, RESP_BODY_MAX) + "…[cut]" : t;
+        } catch (_) { respBody = "[unreadable]"; }
+
+        window.postMessage({
+          source: "xhs-netlog-intercept",
+          method: this.__i_method || "GET",
+          url,
+          status: this.status,
+          reqHeaders: this.__i_headers || {},
+          respBody,
+          ts: Date.now(),
+        }, "*");
       }
     });
     return _xhrSend.apply(this, arguments);

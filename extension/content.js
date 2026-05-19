@@ -223,3 +223,31 @@ async function cmdSetFileInput({ selector, files }) {
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+// ─── NetLog 信号转发 + 启用状态同步 ──────────────────────────────
+
+// MAIN world interceptor → content (postMessage) → background (runtime)
+window.addEventListener("message", (e) => {
+  if (e.source !== window) return;
+  if (e.data?.source === "xhs-netlog-intercept") {
+    chrome.runtime.sendMessage({
+      type: "NETLOG_INTERCEPTOR_ENTRY",
+      payload: e.data,
+    }).catch(() => {});
+  }
+});
+
+// 启动时同步 netlog 启用状态到 MAIN world
+function _syncNetlogStatus() {
+  chrome.runtime.sendMessage({ type: "NETLOG_GET_ENABLED" }, (resp) => {
+    window.postMessage({ source: "xhs-netlog-status", enabled: !!resp?.enabled }, "*");
+  });
+}
+_syncNetlogStatus();
+
+// 监听 background 推送的启用状态变化
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type === "NETLOG_ENABLED_CHANGED") {
+    window.postMessage({ source: "xhs-netlog-status", enabled: !!msg.enabled }, "*");
+  }
+});

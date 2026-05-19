@@ -270,3 +270,56 @@ chrome.webRequest.onErrorOccurred.addListener(
   (d) => _netlogFinalize(d, true),
   NETLOG_URL_FILTER,
 );
+
+// ─── Step 4.6: ingestInterceptor（关联回填） ─────────────────────────────────
+
+const NETLOG_INTERCEPTOR_WINDOW_MS = 2000;
+
+function netlogIngestInterceptor(payload) {
+  if (!_netEnabled || !payload) return;
+
+  // 在最近 2s 内倒序找匹配 (method + url)，给该 entry 填响应体
+  for (let i = _netBuffer.length - 1; i >= 0; i--) {
+    const e = _netBuffer[i];
+    if (payload.ts - e.ts > NETLOG_INTERCEPTOR_WINDOW_MS) break;
+    if (e.method === payload.method && e.url === payload.url && !e.respBody) {
+      e.respBody = payload.respBody;
+      // 合并 interceptor 头（webRequest 拿不到的应用层头）
+      for (const [k, v] of Object.entries(payload.reqHeaders || {})) {
+        const lk = k.toLowerCase();
+        if (!e.reqHeaders[lk]) e.reqHeaders[lk] = v;
+      }
+      return;
+    }
+  }
+
+  // 没关联上，独立存
+  _netlogPush({
+    id: `${payload.ts}_intercept`,
+    requestId: "",
+    ts: payload.ts,
+    tsLabel: _tsLabel(payload.ts),
+    method: payload.method,
+    url: payload.url,
+    host: (() => { try { return new URL(payload.url).host; } catch (_) { return ""; } })(),
+    path: (() => { try { const u = new URL(payload.url); return u.pathname + (u.search || ""); } catch (_) { return payload.url; } })(),
+    resourceType: "xmlhttprequest",
+    tabId: -1,
+    reqHeaders: payload.reqHeaders || {},
+    reqBody: null,
+    reqFingerprint: null,
+    status: payload.status,
+    statusLine: "",
+    respHeaders: {},
+    respBody: payload.respBody,
+    setCookie: null,
+    duration_ms: 0,
+    err: null,
+    category: "other",
+    signals: [],
+    cookieDiff: null,
+    redirectTo: null,
+    errorCode: null,
+    _orphan: true,
+  });
+}
