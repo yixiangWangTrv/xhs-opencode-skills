@@ -427,3 +427,221 @@ python scripts/cli.py risk-report
 - `scripts/xhs/bridge.py` — 新增 `get_netlog()` / `get_netlog_enabled()` 方法，调用 background.js 的 `get_netlog` / `get_netlog_enabled` 命令
 - `extension/background.js` — handleCommand switch 新增 `case "get_netlog"` / `case "get_netlog_enabled"`，通过 websocket bridge 路径响应（与 popup 内部 chrome.runtime.sendMessage 路径独立）
 
+---
+
+## 附录：XHS 反爬体系深度反推（2026-05-19 实施 + 冒烟）
+
+本会话端到端跑通了 search / fill-publish 两个场景，结合 netlog 实测数据反推了 XHS 完整的反自动化检测体系。
+
+### 五层防护架构
+
+```
+┌─ 第 5 层：服务端规则引擎 ────────────┐  ML + 规则混合 → isRiskUser 输出
+│  (XHS 自家 + 阿里云风控 SaaS)        │  pass / risk / limit / block
+├─ 第 4 层：行为埋点 t2/collect ───────┤  protobuf，每操作 1-10 条
+│  (XHS 自家 nameTracker=wapT)         │  操作标签 + 时序 + 上下文
+├─ 第 3 层：远程脚本 sec/v1/scripting ─┤  动态下发 JS 在浏览器执行
+│  (callFrom=web/creator-platform)     │  采集 mouse/keyboard/检测自动化
+├─ 第 2 层：Shield SDK webprofile ─────┤  浏览器/设备指纹加密上报
+│  (sdkVersion 4.3.5, profileData hex) │  navigator/canvas/webgl/audio
+└─ 第 1 层：WAF 边缘 acw_tc ───────────┘  IP/UA 信誉 + 频率
+   (阿里云)                              跨子域统一会话追踪
+```
+
+### 关键检测维度（按重要性）
+
+#### 1. 服务端风控判定 `isRiskUser`（最具利用价值）
+
+每个业务 API 调用后，前端 SDK 将服务端的风控判定主动回传到 APM：
+
+```json
+POST apm-fe.xiaohongshu.com/api/data
+[{
+  "measurement_name": "httpRequestTiming",
+  "measurement_data": {
+    "matchedPath": "/api/sns/web/v1/search/onebox",
+    "isRiskUser": "pass",               ← 服务端判定: pass / risk / limit / block
+    "isRiskReason": "[]",                ← 触发的规则数组
+    "i12": 16, "i13": 32, "i14": 100,    ← 多维评分（命名混淆）
+    "traceId": "cf2041020f9322b15...",
+    "status": 200, ...
+  }
+}]
+```
+
+**反推**：`i12/i13/i14` 是 0-100 的评分维度（推测：行为序列分 / 指纹分 / 网络环境分）。实测 `unread_count` 这种高频轮询接口 i14=62（中位），普通业务 API i14=100（满分），创作中心 i14=85。
+
+**实战利用**：自动化操作过程中实时读 `isRiskUser`，从 `pass` 变其他状态立即停手。
+
+#### 2. 浏览器指纹 Shield SDK 4.3.5
+
+```json
+POST as.xiaohongshu.com/api/sec/v1/shield/webprofile
+{
+  "platform": "Windows",
+  "sdkVersion": "4.3.5",        ← XHS Shield SDK 版本（可追踪迭代）
+  "svn": "2",
+  "profileData": "c058828ff..."  ← 加密 hex 串（含 navigator/canvas/webgl/audio/字体）
+}
+```
+
+#### 3. 远程下发脚本 `/api/sec/v1/scripting`（JSONP 模式）
+
+```json
+POST /api/sec/v1/scripting
+{ "callFrom": "web", "callback": "seccallback" }            ← 主站
+{ "callFrom": "creator-platform", "type": "ds", "appId": "ugc" }  ← 创作中心
+```
+
+—— 服务端动态下发 JS 在浏览器本地执行，采集 mouse/keyboard timing + 检测 webdriver/Puppeteer 痕迹。`callFrom` 按场景下发不同检测脚本。
+
+#### 4. 行为采集 `t2.xiaohongshu.com/api/v2/collect`
+
+protobuf binary 编码（base64），每个用户操作 1-10 条。明文可见：
+- artifact: `xhs-pc-web` 6.11.1
+- app: `discovery-undefined` / `ugc`（创作中心）
+- device_id: `febeb55be25f2a4093229f58643bd140`（32 字符 hex，跨上报一致）
+- user_id, session UUIDs, UA
+- **中文操作标签**：`创作者-新发布视频题` / `创作者服务平台` / `official`
+
+#### 5. APM 行为埋点 `apm-fe.xiaohongshu.com/api/data` (wapT SDK)
+
+JSON 明文，每个 API 调用一条 timing 记录，含：
+- `context_sdkSessionId / pageSessionId / sdkSeqId`（**单调递增**，跳号即异常）
+- `context_deviceId`（与 t2 一致）
+- `context_route`（完整页面路由）
+- `context_artifactName: "xhs-pc-web"`
+- `measurement_name: "httpRequestTiming"` 含 `isRiskUser`（见 #1）
+
+#### 6. 业务 API 签名 `x-s-common`
+
+实测 25/27 业务 API 带 `x-s-common` header。**旧 spec 假设的 `xs / xt` 双签名已废弃**（实测 0 命中）。XHS 演进为 `x-s-common` 单签名方案。
+
+主站签名覆盖率 92%，创作中心 60%（大量 OPTIONS preflight 无签名）。
+
+#### 7. Cookie 一致性追踪
+
+| Cookie | 用途 |
+|---|---|
+| `a1`（设备指纹种子） | 100% 命中，device_id 派生自 |
+| `web_session` | 主站登录态 |
+| `webId` / `gid` | 浏览器 ID / 设备识别 |
+| `acw_tc`（阿里云 WAF）| **跨子域统一指纹**，每次跨子域跳转重新颁发，强一致追踪 |
+| `tgw_l7_route`（阿里云 SLB）| ros-upload 每次 PUT 都换路由 cookie，防 hash 缓存攻击 |
+| CAS SSO 链 5 cookie | 创作中心独立 session（见 #9） |
+
+#### 8. ros-upload 上传链路
+
+```
+1. GET creator/api/media/v1/upload/creator/permit?biz_name=spectrum&scene=image
+   响应: { code:0, data: { uploadTempPermits, result } }  ← 预签名 URL
+2. OPTIONS ros-upload.xiaohongshu.com/?speedTestToken=xxx  ← CDN 选优
+3. PUT ros-upload.xiaohongshu.com/spectrum/<obj_key>       ← binary 上传
+```
+
+`biz_name=spectrum` 是 XHS 内部图片处理服务 / OSS bucket 代号。
+
+#### 9. 创作中心 CAS SSO 鉴权链
+
+创作中心**独立于主站 session**，必须经过 CAS 拿单独的 creator session：
+
+```
+1. /publish/publish → 401（无 creator session）
+2. → /login?redirectReason=401 重定向
+3. → customer.xiaohongshu.com/api/cas/customer/web/zones
+4. → customer.xiaohongshu.com/api/cas/customer/web/service-ticket
+5. → 5 cookie：customer-sso-sid / x-user-id-creator.xiaohongshu.com /
+       access-token-creator.xiaohongshu.com / galaxy_creator_session_id /
+       galaxy.creator.beaker.session.id
+6. → /publish/publish 带 creator session 重试
+```
+
+#### 10. A/B 测试 + 检测规则分层 `racing_get/report`
+
+```json
+POST edith.xiaohongshu.com/api/sns/web/racing_get
+POST edith.xiaohongshu.com/api/sns/web/racing_report
+{
+  "racing_info": [
+    { "web_id": "febeb55b...", "domain": "web_ab" },     ← 设备级 A/B
+    { "user_id": "6919c59d...", "domain": "web_user" }    ← 用户级 A/B
+  ],
+  "source": "web",
+  "app": "creator-publish"
+}
+```
+
+XHS 给不同用户分配不同检测规则版本（A/B 分流）。同一段自动化代码对不同账号可能效果不同。
+
+### 🚨 反爬陷阱：Honey Pot Tab（实施时新发现）
+
+XHS 创作中心给每个 tab 放**真+假**两份：
+
+```html
+<!-- 真 tab：Vue scoped，无 hp 标记，藏在 -9999px 但 pointer-events: auto -->
+<div data-v-1ff40f7c data-v-0b179352 class="creator-tab"
+     style="position: absolute; left: -9999px; top: -9999px;">
+  <span class="title">上传图文</span>
+</div>
+
+<!-- 假 tab (honey pot)：data-hp-kind + button-hp-installed，opacity:1e-05 -->
+<div class="creator-tab" button-hp-installed="1"
+     data-hp-kind="creator-tab-上传图文" aria-hidden="true"
+     style="position: absolute; opacity: 1e-05; pointer-events: auto;">
+</div>
+```
+
+**点击 honey pot 会被标记为机器人 + active class 静默不切换**。正确策略：排除任何带 `data-hp-kind` 或 `button-hp-installed` 属性的元素，只点真 Vue tab。
+
+**`active` class 会故意放在 honey pot 上反向迷惑机器人**（让你以为切换失败）。实际页面已切换，后续 selector 都能工作。
+
+### 反爬规避总策略（给自动化 / Claude）
+
+| 维度 | 风险 | 规避策略 |
+|---|---|---|
+| `isRiskUser` APM 字段 | 🔥极高（也是机会） | 主动监听：从业务 API 响应间接通过 APM 读取，pass→其他立即停手 |
+| Shield profileData | 🔥极高 | 用真实浏览器，禁止覆盖 navigator/screen/canvas/webgl |
+| `scripting` 远程脚本 | 🔥极高 | 让其正常下发执行，不要 hook 全局 `seccallback` 函数 |
+| **Honey pot tab 陷阱** | 🔥高 | 排除 `data-hp-kind` / `button-hp-installed` 元素 |
+| device_id 一致性 | 🔥高 | 不清 a1 cookie，不切 device_id |
+| 鼠标轨迹 / 键盘节奏 | 高 | Bezier 曲线 mouse move + 字符间随机 50-150ms + 0.5% 概率打错-删-重打 |
+| 操作时序 | 高 | 每个 action 间 N(2.5s, 0.8s) 高斯停顿；偶尔 5-10s 长停顿模拟"看一下" |
+| t2 protobuf 埋点 | 中 | 不屏蔽（缺失反而异常），节奏自然 |
+| `acw_tc` 跨域 | 中 | 不阻止 Set-Cookie，让 WAF 跟踪正常 |
+| CAS SSO（创作中心）| 中 | 必须走完 CAS 拿 creator session 5-cookie 链 |
+| racing A/B 分流 | 低 | 让其正常执行；保持账号年龄/行为画像 |
+
+### Response.prototype hook 必要性
+
+XHS 主 bundle 加载时用混淆代码（`_garp_xxx`）覆盖 `window.fetch`，绕过我们 `document_start` 装的 fetch hook。**Response.prototype.text/.json 是不可绕过的 hook 点**：任何代码读响应体必须调这两个方法之一。
+
+实施细节：interceptor.js 在 IIFE 顶部 capture `Response.prototype.text/.json` 引用，替换为我们的版本，原方法被调用时 postMessage 上报响应体。
+
+### 实施期间发现的 Bug 修复
+
+| 类型 | 修复 |
+|---|---|
+| **interceptor.js syntax error** | 4 处中文字符串嵌套未转义双引号（line 100/194/214/480），导致**整个 interceptor.js 从未成功 parse**。修：内部 `""` 改为中文「」 |
+| **状态同步链路竞态** | interceptor 等 content.js postMessage 启用状态期间所有 fetch 被跳过。修：interceptor 总是上报，background `netlogIngestInterceptor` 单点过滤 |
+| **URL 匹配 protocol-relative** | edith 业务 API 用 `//edith...` 协议相对 URL，与 webRequest 的绝对 URL 不等。修：`_netlogUrlMatch` 加 base URL 兼容 |
+| **fetch wrapper 覆盖** | XHS `_garp_xxx` 直接覆盖 `window.fetch`。修：改 hook Response.prototype |
+| **publish.py honey pot 陷阱** | 旧 selector 点了 `data-hp-kind` 假 tab。修：排除 hp 属性 + 等 active 切换确认 |
+| **REQBODY_MAX 2KB 截断** | APM 上报含 isRiskUser 的 JSON 1-3KB，2048 字节截断导致 JSON parse 失败。修：增大到 8192 |
+| **risk_analyzer regex 容错** | reqBody 仍可能截断时 JSON parse 失败。修：正则提取 isRiskUser/isRiskReason/i12-i14，不依赖完整 JSON |
+
+### 已知限制 / 未来改进
+
+- 账号切换不自动 clear netlog（用户需手动清空）
+- 跨域风控上报域响应体看不到（webRequest 限制 + 跨域无 interceptor）
+- 同一 url 短时间高并发请求时关联可能漏配（2s 时间窗 + url 模糊匹配）
+- `publish.py` 中 `_wait_for_upload_complete` 也可能命中类似 honey pot（待用户实测确认）
+- 当前账号已建立信任画像，所有实测 isRiskUser 均为 `pass`。要实测 `risk/limit/block` 需要：① 高频机械操作触发降评分，或 ② 在新账号上测试
+
+### 端到端冒烟实测结果
+
+| 场景 | total | isRiskUser | acw_tc 变更 | x-s-common 覆盖 | 主要 host |
+|---|---|---|---|---|---|
+| 浏览/搜索 (search "claude") | 146 | 全 pass (40/40) | 1 | 92% | t2(64) edith(27) apm-fe(25) |
+| 搜索 "ai" | 99 | 全 pass (27/27) | 0 | - | apm-fe(28) t2(28) edith(14) |
+| **创作中心填表** | 284 | 全 pass (7/7) | 1 | 60% | apm-fe(108) t2(71) as(19) edith(19) creator(16) ros-upload(3) |
+
