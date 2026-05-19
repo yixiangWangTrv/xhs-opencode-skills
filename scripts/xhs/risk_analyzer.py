@@ -6,8 +6,15 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter, defaultdict
 from typing import Any
+
+# regex 兜底：reqBody 可能被截断导致 JSON.parse 失败，用正则直接抓字段
+_RE_RISK_USER = re.compile(r'"isRiskUser"\s*:\s*"([^"]+)"')
+_RE_RISK_REASON = re.compile(r'"isRiskReason"\s*:\s*"([^"]*)"')
+_RE_MATCHED_PATH = re.compile(r'"matchedPath"\s*:\s*"([^"]+)"')
+_RE_I_FIELDS = re.compile(r'"i1[234]"\s*:\s*(\d+)')
 
 
 def analyze(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -29,6 +36,10 @@ def analyze(entries: list[dict[str, Any]]) -> dict[str, Any]:
 
     # 按 host 分组
     by_host: Counter[str] = Counter(e.get("host", "") for e in entries)
+
+    # 提前定义信号收集容器（后面 axes 提取过程中也会写）
+    high_signals: list[str] = []
+    warnings: list[str] = []
 
     # ── 检测维度提取 ──────────────────────────────────────────────
     axes: dict[str, Any] = {}
@@ -94,6 +105,48 @@ def analyze(entries: list[dict[str, Any]]) -> dict[str, Any]:
             ),
         }
 
+    # 服务端风控判定（从 APM 上报的 measurement_data 反推 isRiskUser 字段）
+    risk_judgments: list[dict[str, Any]] = []
+    for e in apm_entries:
+        body = e.get("reqBody") or ""
+        if "isRiskUser" not in body:
+            continue
+        users = _RE_RISK_USER.findall(body)
+        reasons = _RE_RISK_REASON.findall(body)
+        paths = _RE_MATCHED_PATH.findall(body)
+        for i, status in enumerate(users):
+            risk_judgments.append({
+                "ts": e.get("tsLabel"),
+                "matchedPath": paths[i] if i < len(paths) else None,
+                "isRiskUser": status,
+                "isRiskReason": reasons[i] if i < len(reasons) else None,
+            })
+    if risk_judgments:
+        user_states = Counter(r["isRiskUser"] for r in risk_judgments)
+        non_pass = [r for r in risk_judgments if r["isRiskUser"] != "pass"]
+        axes["server_risk_judgment"] = {
+            "source": "apm-fe/api/data measurement_data.isRiskUser",
+            "total_judgments": len(risk_judgments),
+            "states": dict(user_states),
+            "non_pass_count": len(non_pass),
+            "evidence": (
+                f"前端 SDK 在 {len(risk_judgments)} 个 API 调用后上报服务端风控判定结果到 APM。"
+                f"状态分布：{dict(user_states)}。"
+                + (f"⚠️ {len(non_pass)} 个非 pass 状态" if non_pass else "全部 pass，未被识别")
+            ),
+            "non_pass_samples": [
+                {"ts": r["ts"], "path": r["matchedPath"], "state": r["isRiskUser"],
+                 "reason": r["isRiskReason"]}
+                for r in non_pass[:5]
+            ],
+        }
+        # 任何非 pass 都是高风险信号
+        for r in non_pass:
+            high_signals.append(
+                f"⚠️ isRiskUser={r['isRiskUser']} reason={r['isRiskReason']} "
+                f"on {r['matchedPath']}"
+            )
+
     # 业务 API 签名
     business_entries = [
         e for e in entries
@@ -120,7 +173,7 @@ def analyze(entries: list[dict[str, Any]]) -> dict[str, Any]:
         }
 
     # Cookie 状态（取最新有 reqFingerprint 的 entry）
-    fp_with_cookie = [e for e in entries if e.get("reqFingerprint", {}).get("cookie")]
+    fp_with_cookie = [e for e in entries if (e.get("reqFingerprint") or {}).get("cookie")]
     if fp_with_cookie:
         latest = fp_with_cookie[-1]["reqFingerprint"]["cookie"]
         axes["cookie_state"] = {
@@ -133,8 +186,6 @@ def analyze(entries: list[dict[str, Any]]) -> dict[str, Any]:
         }
 
     # ── 风险信号 ──────────────────────────────────────────────
-    high_signals: list[str] = []
-    warnings: list[str] = []
 
     for e in entries:
         cat = e.get("category", "")
