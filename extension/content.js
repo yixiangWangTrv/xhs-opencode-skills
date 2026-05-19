@@ -4,7 +4,20 @@
  * 接收来自 background.js 的 DOM 操作命令并执行。
  * evaluate / has_element 等需要访问页面 JS 变量的命令由 background.js
  * 通过 chrome.scripting.executeScript(world:"MAIN") 直接处理，不经过这里。
+ *
+ * 同时负责接收来自 interceptor.js（MAIN world）的 postMessage，
+ * 将 404 诊断事件转发给 background.js 存储。
  */
+
+// ── interceptor.js (MAIN world) → background.js 桥接 ────────
+window.addEventListener("message", (e) => {
+  if (e.source !== window) return;
+  if (e.data?.source !== "xhs-interceptor" || e.data?.type !== "BLOCK_EVENT") return;
+  chrome.runtime.sendMessage({ type: "XHS_BLOCK_EVENT", event: e.data.event }).catch(() => {});
+});
+
+// 通知 interceptor.js：content.js 已就绪，可以 flush 排队的事件
+window.postMessage({ source: "xhs-content-ready" }, "*");
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   handleDomCommand(msg.method, msg.params || {})

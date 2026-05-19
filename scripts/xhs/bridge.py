@@ -141,6 +141,9 @@ class BridgePage:
             """
         )
 
+    def click_element_by_text(self, selector: str, text: str) -> None:
+        self._call("click_element_by_text", {"selector": selector, "text": text})
+
     def input_text(self, selector: str, text: str) -> None:
         self._call("input_text", {"selector": selector, "text": text})
 
@@ -225,6 +228,26 @@ class BridgePage:
         if result and result.get("data"):
             return base64.b64decode(result["data"])
         return b""
+
+    # ─── 风控分析 ────────────────────────────────────────────────
+
+    def get_404_diagnostics(self) -> list[dict]:
+        """获取拦截器捕获的 404/461/403/999 诊断事件列表（最近 50 条）。
+        每条事件包含请求上下文、cookie 快照、以及根因分析。
+        """
+        return self._call("get_404_diagnostics") or []
+
+    def clear_404_diagnostics(self) -> None:
+        """清空已存储的诊断事件。"""
+        self._call("clear_404_diagnostics")
+
+    def analyze_risk_control(self, probe_urls: list[str] | None = None) -> dict:
+        """分析小红书风控状态。
+        检查自动化指纹（webdriver、plugins、WebGL 等）、页面风控元素、
+        并实时探测关键 API 端点的响应状态。
+        返回结构化报告，含 risk_level（safe/low/medium/high）和 issues 列表。
+        """
+        return self._call("analyze_risk_control", {"probeUrls": probe_urls or []})
 
     # ─── 无操作（原 CDP 专有功能，扩展模式不需要） ─────────────────
 
