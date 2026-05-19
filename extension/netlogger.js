@@ -297,7 +297,8 @@ function netlogIngestInterceptor(payload) {
   for (let i = _netBuffer.length - 1; i >= 0; i--) {
     const e = _netBuffer[i];
     if (payload.ts - e.ts > NETLOG_INTERCEPTOR_WINDOW_MS) break;
-    if (e.method === payload.method && _netlogUrlMatch(e.url, payload.url) && !e.respBody) {
+    const methodOk = payload.method === "?" || e.method === payload.method;
+    if (methodOk && _netlogUrlMatch(e.url, payload.url) && !e.respBody) {
       e.respBody = payload.respBody;
       // 合并 interceptor 头（webRequest 拿不到的应用层头）
       for (const [k, v] of Object.entries(payload.reqHeaders || {})) {
@@ -314,7 +315,7 @@ function netlogIngestInterceptor(payload) {
     requestId: "",
     ts: payload.ts,
     tsLabel: _tsLabel(payload.ts),
-    method: payload.method,
+    method: payload.method === "?" ? "UNKNOWN" : payload.method,
     url: payload.url,
     host: (() => { try { return new URL(payload.url).host; } catch (_) { return ""; } })(),
     path: (() => { try { const u = new URL(payload.url); return u.pathname + (u.search || ""); } catch (_) { return payload.url; } })(),

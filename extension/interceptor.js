@@ -272,6 +272,47 @@
   });
   setTimeout(flushPending, 800);
 
+  // ── Response.prototype hook ─────────────────────────────────
+  // XHS 在主 bundle 加载时会用混淆代码覆盖 window.fetch，绕过我们的 fetch hook。
+  // 改为 hook Response.prototype.text/.json：任何代码读响应体都必须调这两个之一，
+  // 包括 XHS 的 wrapper 链最终也得到 Response 对象。
+
+  const _respText = Response.prototype.text;
+  const _respJson = Response.prototype.json;
+
+  function _netlogReportResp(url, status, body) {
+    if (!url || !url.includes("xiaohongshu.com")) return;
+    let truncated = body;
+    if (typeof body === "string" && body.length > RESP_BODY_MAX) {
+      truncated = body.slice(0, RESP_BODY_MAX) + "…[cut]";
+    }
+    try {
+      window.postMessage({
+        source: "xhs-netlog-intercept",
+        method: "?",                // Response 对象拿不到原 method
+        url,
+        status,
+        reqHeaders: {},
+        respBody: truncated,
+        ts: Date.now(),
+      }, "*");
+    } catch (_) {}
+  }
+
+  Response.prototype.text = async function() {
+    const body = await _respText.call(this);
+    _netlogReportResp(this.url, this.status, body);
+    return body;
+  };
+
+  Response.prototype.json = async function() {
+    const data = await _respJson.call(this);
+    try {
+      _netlogReportResp(this.url, this.status, JSON.stringify(data));
+    } catch (_) {}
+    return data;
+  };
+
   // ── fetch 拦截 ───────────────────────────────────────────────
 
   const _fetch = window.fetch;
