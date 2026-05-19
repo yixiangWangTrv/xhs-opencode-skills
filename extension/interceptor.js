@@ -97,7 +97,7 @@
           root_cause: "xs 请求签名完全缺失",
           cause_category: "signature",
           detail:
-            "HTTP 461 是小红书专用的"签名缺失"状态码。" +
+            "HTTP 461 是小红书专用的「签名缺失」状态码。" +
             "所有 /api/ 接口均要求 xs header（HMAC 签名），未携带时直接返回 461。",
           confidence: "high",
           how_xhs_decides:
@@ -191,7 +191,7 @@
         cause_category: "signature",
         detail:
           "部分高敏感 API 端点（通常是读取用户隐私数据类）在签名缺失时直接返回 404 而非 461，" +
-          "使爬虫难以区分"不存在"和"无权访问"。",
+          "使爬虫难以区分「不存在」和「无权访问」。",
         confidence: "medium",
         how_xhs_decides:
           "API 网关根据端点安全级别配置响应码策略：" +
@@ -211,7 +211,7 @@
       how_xhs_decides:
         "服务端对每个 {IP, userId, deviceId} 三元组维护实时行为评分：" +
         "请求间隔方差、路径分布、滚动事件频率等，评分低于阈值时对特定内容返回 404，" +
-        "但登录态保持正常（避免用户察觉），造成"内容消失"的假象。",
+        "但登录态保持正常（避免用户察觉），造成「内容消失」的假象。",
     };
   }
 
@@ -477,7 +477,7 @@
           : {
               root_cause: "xsec_token 缺失，服务端返回空内容，前端渲染 404",
               cause_category: "token",
-              detail: "URL 不含 xsec_token，服务端返回了"内容不存在"的数据包，前端据此渲染 404 页面。",
+              detail: "URL 不含 xsec_token，服务端返回了「内容不存在」的数据包，前端据此渲染 404 页面。",
               confidence: "high",
               how_xhs_decides:
                 "同页面级 404 逻辑：token 缺失 → 服务端返回空 note 数据 → 前端渲染 notFound 组件。",
