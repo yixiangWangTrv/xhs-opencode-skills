@@ -163,6 +163,13 @@ async function handleCommand(msg) {
     case "type_text":
       return await cmdTypeTextViaDebugger(params);
 
+    // ── NetLog 风控数据 ──
+    case "get_netlog":
+      return { entries: netlogGetAll(), enabled: netlogIsEnabled() };
+
+    case "get_netlog_enabled":
+      return { enabled: netlogIsEnabled() };
+
     // ── 风控分析 ──
     case "analyze_risk_control":
       return await cmdAnalyzeRiskControl(params);

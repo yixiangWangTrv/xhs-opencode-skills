@@ -756,6 +756,48 @@ def cmd_check_risk(args: argparse.Namespace) -> None:
         browser.close()
 
 
+def cmd_get_netlog(args: argparse.Namespace) -> None:
+    """获取 NetLog 原始 entries（最多 500 条）。"""
+    browser, page = _connect(args)
+    try:
+        if not page.get_netlog_enabled():
+            print(json.dumps({
+                "error": "netlogger 未启用",
+                "hint": "请打开扩展 popup，标题"XHS Bridge"连点 5 次激活 NetLog 后重试",
+            }, ensure_ascii=False, indent=2))
+            sys.exit(2)
+
+        entries = page.get_netlog()
+        if args.limit:
+            entries = entries[-args.limit:]
+        print(json.dumps({
+            "total": len(entries),
+            "entries": entries,
+        }, ensure_ascii=False, indent=2))
+    finally:
+        browser.close()
+
+
+def cmd_risk_report(args: argparse.Namespace) -> None:
+    """基于 NetLog 数据生成风控分析报告。"""
+    from xhs.risk_analyzer import analyze
+
+    browser, page = _connect(args)
+    try:
+        if not page.get_netlog_enabled():
+            print(json.dumps({
+                "error": "netlogger 未启用",
+                "hint": "请打开扩展 popup，标题"XHS Bridge"连点 5 次激活 NetLog 后重试",
+            }, ensure_ascii=False, indent=2))
+            sys.exit(2)
+
+        entries = page.get_netlog()
+        report = analyze(entries)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    finally:
+        browser.close()
+
+
 def cmd_publish_video(args: argparse.Namespace) -> None:
     """发布视频内容。"""
     from xhs.publish_video import publish_video_content
@@ -981,6 +1023,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="额外探测的 API URL 列表",
     )
     sub.set_defaults(func=cmd_check_risk)
+
+    # get-netlog
+    sub = subparsers.add_parser("get-netlog", help="获取 NetLog 原始 entries（需先在 popup 激活）")
+    sub.add_argument("--limit", type=int, default=None, help="只取最近 N 条")
+    sub.set_defaults(func=cmd_get_netlog)
+
+    # risk-report
+    sub = subparsers.add_parser("risk-report", help="基于 NetLog 生成风控分析报告")
+    sub.set_defaults(func=cmd_risk_report)
 
     return parser
 

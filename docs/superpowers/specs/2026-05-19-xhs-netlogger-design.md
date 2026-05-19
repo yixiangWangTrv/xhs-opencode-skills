@@ -13,12 +13,11 @@
 ### 目标
 
 - 在 xiaohongshu.com 业务域 + 风控上报域采集足够信息，识别 XHS 服务端用来判定自动化的信号（cookie / header / 请求体指纹 / 响应错误码 / Set-Cookie 变化）。
-- 数据只在扩展 popup 内消费，不暴露 CLI。
+- 数据在扩展 popup 内消费，同时通过 CLI 命令 `get-netlog` / `risk-report` 暴露给 LLM/Claude，让自动化操作过程中能主动判断风控状态。
 - 隐藏入口：默认对普通使用零感知，通过彩蛋（标题连点 5 次）激活。
 
 ### 非目标
 
-- 不做 CLI 命令暴露 `get-netlog / export-netlog`（用户明确不需要）。
 - 不做跨会话 diff、两会话对比（方案 C，本期延后）。
 - 不做风控域名的自定义配置 UI（本期 hardcode）。
 - 不做自动化测试（浏览器扩展 + 真实 XHS 域难离线复现）。
@@ -354,4 +353,77 @@ content-type, server, x-application-context
 - 没看到 sentry / aegis 等第三方 —— XHS 用自家 apm-fe，未外接
 
 如果后续遇到 netlog 漏抓某些请求，回头检查 host_permissions 是否需要扩展。
+
+---
+
+## CLI 风控接口
+
+**背景**：Task 8 冒烟实测发现 XHS 检测维度的核心规律后，决定将 netlog 数据通过 CLI 暴露给 LLM/Claude，让自动化操作过程中能主动读取风控结论，替代此前"只在 popup 内消费"的决定。
+
+### 命令
+
+#### `get-netlog [--limit N]`
+
+从扩展获取当前会话的 NetLog 原始 entries（最多 500 条环形缓冲）。
+
+```bash
+python scripts/cli.py get-netlog
+python scripts/cli.py get-netlog --limit 50
+```
+
+输出格式：
+
+```json
+{
+  "total": 123,
+  "entries": [ /* NetLogEntry[] */ ]
+}
+```
+
+未启用 netlogger 时：exit code 2 + 中文提示用户去 popup 彩蛋激活。
+
+#### `risk-report`
+
+调用 `scripts/xhs/risk_analyzer.py` 的 `analyze()` 函数，基于 netlog entries 反推检测维度并给出结构化风控结论。
+
+```bash
+python scripts/cli.py risk-report
+```
+
+输出格式：
+
+```json
+{
+  "risk_level": "safe | low | medium | high | unknown",
+  "total_requests": 123,
+  "summary": "本会话采集 123 条请求，指纹上报 2 次，行为埋点 54 次。",
+  "detection_axes": {
+    "browser_fingerprint": { "endpoint": "/api/sec/v1/shield/webprofile", "called_count": 2, ... },
+    "behavior_tracking": { "endpoint": "/api/v2/collect", "called_count": 54, ... },
+    "apm_monitoring": { ... },
+    "request_signature": { "scheme": "x-s-common (current)", "coverage_pct": 92.6, ... },
+    "cookie_state": { "has_a1": true, "has_web_session": true, ... }
+  },
+  "category_distribution": { "business_api": 60, "fingerprint_upload": 12, ... },
+  "top_hosts": { "edith.xiaohongshu.com": 60, ... },
+  "high_risk_signals": [],
+  "warnings": []
+}
+```
+
+### 风险等级判断规则
+
+| risk_level | 触发条件 |
+|---|---|
+| `high` | 存在 `signature_failure` 类别请求，或 HTTP 999 响应 |
+| `medium` | HTTP 401 / 403 / 461，或 `acw_tc` cookie 变更，或 `risk_redirect` |
+| `low` | 有 warnings（签名覆盖率不足、行为埋点缺失等） |
+| `safe` | 无高风险信号、无 warnings |
+| `unknown` | netlog 为空 |
+
+### 实现细节
+
+- `scripts/xhs/risk_analyzer.py` — 纯函数 `analyze(entries)` 模块，无副作用，可独立单测
+- `scripts/xhs/bridge.py` — 新增 `get_netlog()` / `get_netlog_enabled()` 方法，调用 background.js 的 `get_netlog` / `get_netlog_enabled` 命令
+- `extension/background.js` — handleCommand switch 新增 `case "get_netlog"` / `case "get_netlog_enabled"`，通过 websocket bridge 路径响应（与 popup 内部 chrome.runtime.sendMessage 路径独立）
 

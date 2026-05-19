@@ -188,3 +188,12 @@ python scripts/cli.py user-profile \
 - **搜索无结果**：建议更换关键词或调整筛选条件。
 - **笔记不可访问**：可能是私密笔记或已删除，提示用户。
 - **用户主页不可访问**：用户可能已注销或设置隐私。
+
+## 风控数据 (NetLog)
+
+如需了解当前会话被 XHS 检测的维度，可调用：
+
+- `python scripts/cli.py get-netlog [--limit N]` —— 获取原始 entries
+- `python scripts/cli.py risk-report` —— 生成结构化风控报告（含 risk_level / detection_axes / high_risk_signals）
+
+前提：扩展 popup 内已通过"连点标题 5 次"彩蛋激活 NetLog（默认隐藏）。

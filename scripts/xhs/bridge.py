@@ -249,6 +249,18 @@ class BridgePage:
         """
         return self._call("analyze_risk_control", {"probeUrls": probe_urls or []})
 
+    # ─── NetLog 风控数据 ─────────────────────────────────────────
+
+    def get_netlog_enabled(self) -> bool:
+        """检查 NetLog 是否已启用（用户在扩展 popup 上彩蛋激活）。"""
+        result = self._call("get_netlog_enabled") or {}
+        return bool(result.get("enabled"))
+
+    def get_netlog(self) -> list[dict]:
+        """获取当前会话的全部 NetLog entries（最多 500 条环形缓冲）。"""
+        result = self._call("get_netlog") or {}
+        return result.get("entries") or []
+
     # ─── 无操作（原 CDP 专有功能，扩展模式不需要） ─────────────────
 
     def inject_stealth(self) -> None:
