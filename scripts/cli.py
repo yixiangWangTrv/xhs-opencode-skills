@@ -763,7 +763,7 @@ def cmd_get_netlog(args: argparse.Namespace) -> None:
         if not page.get_netlog_enabled():
             print(json.dumps({
                 "error": "netlogger 未启用",
-                "hint": "请打开扩展 popup，标题"XHS Bridge"连点 5 次激活 NetLog 后重试",
+                "hint": "请打开扩展 popup，标题 XHS Bridge 连点 5 次激活 NetLog 后重试",
             }, ensure_ascii=False, indent=2))
             sys.exit(2)
 
@@ -787,7 +787,7 @@ def cmd_risk_report(args: argparse.Namespace) -> None:
         if not page.get_netlog_enabled():
             print(json.dumps({
                 "error": "netlogger 未启用",
-                "hint": "请打开扩展 popup，标题"XHS Bridge"连点 5 次激活 NetLog 后重试",
+                "hint": "请打开扩展 popup，标题 XHS Bridge 连点 5 次激活 NetLog 后重试",
             }, ensure_ascii=False, indent=2))
             sys.exit(2)
 
