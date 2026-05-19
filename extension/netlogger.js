@@ -258,7 +258,17 @@ function _netlogFinalize(details, isError) {
   entry.duration_ms = Date.now() - entry._t0;
   delete entry._t0;
   if (isError) entry.err = details.error || "network_error";
-  // 分类逻辑由后续 task 5 接入
+
+  // 分类 + cookieDiff
+  const { category, signals } = _netlogClassify(entry);
+  entry.category = category;
+  entry.signals = signals;
+  entry.cookieDiff = _netlogComputeCookieDiff(entry);
+  if (entry.cookieDiff) {
+    entry.category = entry.category === "other" ? "cookie_change" : entry.category;
+    entry.signals.push("set_cookie_changed:" + entry.cookieDiff.added.join(","));
+  }
+
   _netlogPush(entry);
 }
 
@@ -294,7 +304,7 @@ function netlogIngestInterceptor(payload) {
   }
 
   // 没关联上，独立存
-  _netlogPush({
+  const orphanEntry = {
     id: `${payload.ts}_intercept`,
     requestId: "",
     ts: payload.ts,
@@ -321,5 +331,61 @@ function netlogIngestInterceptor(payload) {
     redirectTo: null,
     errorCode: null,
     _orphan: true,
-  });
+  };
+  // orphan 也跑分类
+  const { category, signals } = _netlogClassify(orphanEntry);
+  orphanEntry.category = category;
+  orphanEntry.signals = signals;
+  _netlogPush(orphanEntry);
+}
+
+// ─── Step 5.1: 分类 + cookieDiff 函数 ────────────────────────────────────────
+
+const NETLOG_FP_HOST_KEYWORDS = ["fp", "sec", "aegis", "sentry", "track", "log"];
+const NETLOG_FP_BODY_KEYWORDS = ["webdriver", "navigator", "screen", "timezone", "platform"];
+
+function _netlogClassify(entry) {
+  const signals = [];
+  let category = "other";
+
+  const hostLow = entry.host.toLowerCase();
+  const isFpHost = NETLOG_FP_HOST_KEYWORDS.some(kw => hostLow.includes(kw));
+  const bodyLow = (entry.reqBody || "").toLowerCase();
+  const fpBodyHit = NETLOG_FP_BODY_KEYWORDS.find(kw => bodyLow.includes(kw));
+
+  // 优先级：signature_failure > risk_redirect > business_error > fingerprint_upload > cookie_change > business_api > page_nav > other
+  if (entry.errorCode && /^30003[123]$/.test(entry.errorCode)) {
+    category = "signature_failure";
+    signals.push(`error_code:${entry.errorCode}`);
+  } else if (entry.redirectTo && /\/(404|login)(\/|\?|$)/.test(entry.redirectTo)) {
+    category = "risk_redirect";
+    signals.push(`redirect:${entry.redirectTo.slice(0, 60)}`);
+  } else if ([401, 403, 461, 999].includes(entry.status)) {
+    category = "business_error";
+    signals.push(`status:${entry.status}`);
+  } else if (isFpHost || fpBodyHit) {
+    category = "fingerprint_upload";
+    signals.push("fingerprint_upload");
+    if (fpBodyHit) signals.push(`body_contains:${fpBodyHit}`);
+  } else if (entry.setCookie && entry.setCookie.length > 0) {
+    // cookie_change 由 cookieDiff 进一步判断（见下）
+    category = "other";
+  } else if (entry.resourceType === "main_frame") {
+    category = "page_nav";
+  } else if (entry.path && entry.path.includes("/api/") && entry.status >= 200 && entry.status < 300) {
+    category = "business_api";
+  }
+
+  return { category, signals };
+}
+
+function _netlogComputeCookieDiff(entry) {
+  if (!entry.setCookie || entry.setCookie.length === 0) return null;
+  const prev = _lastHostCookies.get(entry.host) || new Set();
+  const curr = new Set(entry.setCookie);
+  const added = [...curr].filter(k => !prev.has(k));
+  const removed = [...prev].filter(k => !curr.has(k));
+  _lastHostCookies.set(entry.host, curr);
+  if (added.length === 0 && removed.length === 0) return null;
+  return { added, removed, changed: [] };
 }
