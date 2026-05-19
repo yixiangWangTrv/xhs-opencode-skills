@@ -9,6 +9,9 @@
  * - get_cookies: chrome.cookies.getAll
  */
 
+importScripts("netlogger.js");
+netlogInit();
+
 const BRIDGE_URL = "ws://localhost:9333";
 let ws = null;
 
@@ -57,6 +60,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     chrome.storage.session.get("blockEvents", (data) => {
       sendResponse({ events: data.blockEvents || [] });
     });
+    return true;
+  }
+
+  if (msg.type === "NETLOG_GET_ALL") {
+    sendResponse({ entries: netlogGetAll(), enabled: netlogIsEnabled() });
+    return true;
+  }
+  if (msg.type === "NETLOG_CLEAR") {
+    netlogClear();
+    sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === "NETLOG_SET_ENABLED") {
+    netlogSetEnabled(msg.enabled);
+    sendResponse({ ok: true, enabled: netlogIsEnabled() });
+    return true;
+  }
+  if (msg.type === "NETLOG_GET_ENABLED") {
+    sendResponse({ enabled: netlogIsEnabled() });
     return true;
   }
 });
