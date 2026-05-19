@@ -274,6 +274,48 @@ function showNetlogDetail(entry) {
   el.textContent = JSON.stringify(entry, null, 2);
 }
 
+function renderNetlogCategory(container) {
+  const groups = {};
+  for (const e of _netlogEntries) {
+    if (!groups[e.category]) groups[e.category] = [];
+    groups[e.category].push(e);
+  }
+
+  const order = ["fingerprint_upload", "signature_failure", "risk_redirect",
+                 "business_error", "cookie_change", "business_api", "page_nav", "other"];
+
+  const sections = [];
+  for (const cat of order) {
+    if (!groups[cat] || groups[cat].length === 0) continue;
+    const label = NETLOG_CAT_LABEL[cat];
+    const items = groups[cat].slice(-50);  // 每类最多展示 50 条
+    sections.push(`
+      <details open style="margin-bottom:6px">
+        <summary style="cursor:pointer;font-size:11px;font-weight:600;color:#444">▾ ${label} (${groups[cat].length})</summary>
+        ${items.map((e, i) => {
+          const path = e.path.length > 60 ? e.path.slice(0, 57) + "…" : e.path;
+          const signal = (e.signals || []).slice(0, 2).join(", ");
+          return `<div class="netlog-row cat-${e.category}" data-cat="${cat}" data-idx="${i}">
+            ${e.tsLabel}  ${e.method.padEnd(4)} ${e.status || "?"}  ${e.host.replace(/^www\./, "")}${path}${signal ? "  ["+signal+"]" : ""}
+          </div>`;
+        }).join("")}
+      </details>
+    `);
+  }
+
+  container.innerHTML = sections.join("") || '<div style="color:#aaa;font-size:11px;padding:8px">暂无数据</div>';
+
+  // 详情点击：data-cat + data-idx 反查
+  container.querySelectorAll(".netlog-row").forEach(row => {
+    row.addEventListener("click", () => {
+      const cat = row.dataset.cat;
+      const idx = Number(row.dataset.idx);
+      const entry = groups[cat]?.slice(-50)[idx];
+      if (entry) showNetlogDetail(entry);
+    });
+  });
+}
+
 // tab 切换
 document.querySelectorAll(".netlog-tab").forEach(tab => {
   tab.addEventListener("click", () => {
@@ -291,4 +333,16 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (_netlogEntries.length > 500) _netlogEntries.splice(0, _netlogEntries.length - 500);
     renderNetlog();
   }
+});
+
+document.getElementById("netlog-export")?.addEventListener("click", () => {
+  const blob = new Blob([JSON.stringify(_netlogEntries, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `xhs-netlog-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
