@@ -176,54 +176,71 @@ def _navigate_to_publish_page(page: Page) -> None:
 
 
 def _click_publish_tab(page: Page, tab_name: str) -> None:
-    """点击发布页 TAB（上传图文/上传视频）。"""
+    """点击发布页 TAB（上传图文/上传视频/写长文/发播客）。
+
+    XHS 创作中心反爬陷阱：
+    - 每个 tab 都有"真 + 假"两份。假 tab 有 data-hp-kind / button-hp-installed
+      属性（hp=honey pot），是反爬陷阱，点击会被标记为机器人 + active 不切换。
+    - 真 tab 是 Vue scoped 元素（data-v-* 属性，含 span.title 子元素），藏在
+      style="left: -9999px; top: -9999px;" 之外的位置，但 pointer-events: auto 可点。
+
+    正确策略：只点没有 hp 标记的真 Vue tab，等待 active class 切换确认。
+    """
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        # 查找匹配的 TAB（支持多种结构）
         found = page.evaluate(
             f"""
             (() => {{
-                // 策略1: 查找 div.creator-tab（过滤隐藏元素）
-                let tabs = document.querySelectorAll({json.dumps(CREATOR_TAB)});
-                for (const tab of tabs) {{
-                    const titleSpan = tab.querySelector('span.title');
-                    const tabText = titleSpan ? titleSpan.textContent.trim() : tab.textContent.trim();
-                    if (tabText === {json.dumps(tab_name)}) {{
-                        const rect = tab.getBoundingClientRect();
-                        const style = window.getComputedStyle(tab);
-                        // 跳过隐藏或被移出视口的元素
-                        if (rect.width === 0 || rect.height === 0) continue;
-                        if (rect.left < 0 || rect.top < 0) continue;
-                        if (style.display === 'none' || style.visibility === 'hidden') continue;
-                        const x = rect.left + rect.width / 2;
-                        const y = rect.top + rect.height / 2;
-                        const target = document.elementFromPoint(x, y);
-                        if (target === tab || tab.contains(target)) {{
-                            tab.click();
-                            return 'clicked';
-                        }}
-                        return 'blocked';
-                    }}
-                }}
-                
-                // 策略2: 查找任意包含目标文本的元素
-                const allElements = document.querySelectorAll('*');
-                for (const el of allElements) {{
-                    if (el.children.length === 0 && el.textContent.trim() === {json.dumps(tab_name)}) {{
-                        const rect = el.getBoundingClientRect();
-                        const style = window.getComputedStyle(el);
-                        if (rect.width === 0 || rect.height === 0) continue;
-                        if (rect.left < 0 || rect.top < 0) continue;
-                        if (style.display === 'none' || style.visibility === 'hidden') continue;
-                        el.click();
+                const name = {json.dumps(tab_name)};
+                const tabs = document.querySelectorAll({json.dumps(CREATOR_TAB)});
+
+                // 优先策略：排除 honey pot，找真 Vue tab（含 span.title 且无 hp 标记）
+                for (const t of tabs) {{
+                    if (t.hasAttribute('data-hp-kind') || t.hasAttribute('button-hp-installed')) continue;
+                    const title = t.querySelector('span.title');
+                    if (title && title.textContent.trim() === name) {{
+                        t.click();
                         return 'clicked';
                     }}
                 }}
-                
+
+                // 兜底：所有 tab 中按 span.title 匹配（含 hp 也接受，但仅当真 tab 都找不到时）
+                for (const t of tabs) {{
+                    const title = t.querySelector('span.title');
+                    if (title && title.textContent.trim() === name) {{
+                        t.click();
+                        return 'clicked';
+                    }}
+                }}
+
                 return 'not_found';
             }})()
             """
         )
+
+        # 等待 active class 切换到目标 tab，确认真切换了（不是被 honey pot 吞了点击）
+        if found == "clicked":
+            switched_deadline = time.monotonic() + 5
+            while time.monotonic() < switched_deadline:
+                is_active = page.evaluate(
+                    f"""
+                    (() => {{
+                        const tabs = document.querySelectorAll({json.dumps(CREATOR_TAB)});
+                        for (const t of tabs) {{
+                            if (t.hasAttribute('data-hp-kind') || t.hasAttribute('button-hp-installed')) continue;
+                            const title = t.querySelector('span.title');
+                            if (title && title.textContent.trim() === {json.dumps(tab_name)}) {{
+                                return t.classList.contains('active');
+                            }}
+                        }}
+                        return false;
+                    }})()
+                    """
+                )
+                if is_active:
+                    return
+                time.sleep(0.2)
+            logger.warning("点击了 %s 但 active class 未切换，可能被 honey pot 拦截", tab_name)
 
         if found == "clicked":
             return
