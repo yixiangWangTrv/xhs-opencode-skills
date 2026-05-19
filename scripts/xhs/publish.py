@@ -178,8 +178,13 @@ def _navigate_to_publish_page(page: Page) -> None:
 def _click_publish_tab(page: Page, tab_name: str) -> None:
     """点击发布页 TAB（上传图文/上传视频/写长文/发播客）。
 
-    XHS 创作中心反爬：非激活 tab 会用 left/top: -9999px 或 opacity: 1e-05 隐藏，
-    但保留 pointer-events: auto 可点击。所以 selector 不能查可见性，要用属性精确匹配。
+    XHS 创作中心反爬陷阱：
+    - 每个 tab 都有"真 + 假"两份。假 tab 有 data-hp-kind / button-hp-installed
+      属性（hp=honey pot），是反爬陷阱，点击会被标记为机器人 + active 不切换。
+    - 真 tab 是 Vue scoped 元素（data-v-* 属性，含 span.title 子元素），藏在
+      style="left: -9999px; top: -9999px;" 之外的位置，但 pointer-events: auto 可点。
+
+    正确策略：只点没有 hp 标记的真 Vue tab，等待 active class 切换确认。
     """
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -187,29 +192,22 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
             f"""
             (() => {{
                 const name = {json.dumps(tab_name)};
-                // 策略1: data-hp-kind 属性精确匹配（XHS 给每个 tab 打了 data-hp-kind="creator-tab-<名称>"）
-                let tab = document.querySelector('div.creator-tab[data-hp-kind="creator-tab-' + name + '"]');
-                if (tab) {{
-                    tab.click();
-                    return 'clicked';
-                }}
-
-                // 策略2: 通过 span.title 子元素文字匹配（兼容无 data-hp-kind 的版本）
                 const tabs = document.querySelectorAll({json.dumps(CREATOR_TAB)});
+
+                // 优先策略：排除 honey pot，找真 Vue tab（含 span.title 且无 hp 标记）
                 for (const t of tabs) {{
+                    if (t.hasAttribute('data-hp-kind') || t.hasAttribute('button-hp-installed')) continue;
                     const title = t.querySelector('span.title');
                     if (title && title.textContent.trim() === name) {{
-                        const style = window.getComputedStyle(t);
-                        // 只查 display:none / visibility:hidden（真正不可点）；不查 opacity / position
-                        if (style.display === 'none' || style.visibility === 'hidden') continue;
                         t.click();
                         return 'clicked';
                     }}
                 }}
 
-                // 策略3: textContent 直接匹配（最宽松兜底）
+                // 兜底：所有 tab 中按 span.title 匹配（含 hp 也接受，但仅当真 tab 都找不到时）
                 for (const t of tabs) {{
-                    if (t.textContent.trim() === name) {{
+                    const title = t.querySelector('span.title');
+                    if (title && title.textContent.trim() === name) {{
                         t.click();
                         return 'clicked';
                     }}
@@ -219,6 +217,30 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
             }})()
             """
         )
+
+        # 等待 active class 切换到目标 tab，确认真切换了（不是被 honey pot 吞了点击）
+        if found == "clicked":
+            switched_deadline = time.monotonic() + 5
+            while time.monotonic() < switched_deadline:
+                is_active = page.evaluate(
+                    f"""
+                    (() => {{
+                        const tabs = document.querySelectorAll({json.dumps(CREATOR_TAB)});
+                        for (const t of tabs) {{
+                            if (t.hasAttribute('data-hp-kind') || t.hasAttribute('button-hp-installed')) continue;
+                            const title = t.querySelector('span.title');
+                            if (title && title.textContent.trim() === {json.dumps(tab_name)}) {{
+                                return t.classList.contains('active');
+                            }}
+                        }}
+                        return false;
+                    }})()
+                    """
+                )
+                if is_active:
+                    return
+                time.sleep(0.2)
+            logger.warning("点击了 %s 但 active class 未切换，可能被 honey pot 拦截", tab_name)
 
         if found == "clicked":
             return
