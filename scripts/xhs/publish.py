@@ -121,39 +121,56 @@ def click_publish_button(page: Page) -> None:
     更可靠：不依赖坐标、不依赖 chrome.debugger、不会被反爬的鼠标事件指纹检测。
 
     流程：
-      1. 注入 fetch/XHR 拦截器捕获发布 API 响应
+      1. 注入 3 层响应捕获（XHR/fetch 内容匹配 + console hook + DOM toast 观察器）
       2. host.dispatchEvent(new CustomEvent('publish')) 触发发布
-      3. 轮询拦截结果，识别业务错误码（-9136 = 账号风控）
+      3. 轮询任一层捕获到的结果，识别业务错误码（-9136 = 账号风控）
 
     Raises:
         PublishError: 未找到 host 或按钮被禁用。
         AccountRiskControlError: 账号被风控（如 code=-9136）。
     """
-    # 1) 注入响应拦截器（XHS 用 axios→XMLHttpRequest，必须 wrap XHR；fetch 兜底）
+    # 1) 注入多层响应捕获
+    #    XHS 自家有多层 XHR 拦截嵌套（s1-main / interceptor.js / axios），URL pattern
+    #    无法可靠匹配；用"响应内容标志"判定 + console.error hook + DOM toast 观察器三管齐下。
     page.evaluate(
         """
         (() => {
             window.__xhsPublishResult = null;
 
-            function isPublishApi(url) {
-                if (!url) return false;
-                return url.includes('/note/create')
-                    || url.includes('/publish/')
-                    || url.includes('publish_note')
-                    || url.includes('/note/post')
-                    || url.includes('/api/galaxy/');
+            // 内容标志：成功响应含 note_id；失败响应含 HTTPBizError 或 -913x 风控码或"禁止发笔记"
+            function looksLikePublishResp(body) {
+                if (!body) return false;
+                return body.includes('HTTPBizError')
+                    || /"code":\\s*-913\\d/.test(body)
+                    || body.includes('禁止发笔记')
+                    || /"note_id":\\s*"[^"]+"/.test(body);
             }
 
-            function capture(url, status, bodyText) {
+            function capture(source, info) {
+                if (window.__xhsPublishResult) return;  // first-wins
+                window.__xhsPublishResult = {source, ...info};
+            }
+
+            function captureFromBody(source, url, status, body) {
+                if (window.__xhsPublishResult) return;
+                if (!looksLikePublishResp(body)) return;
                 try {
-                    const j = JSON.parse(bodyText);
-                    window.__xhsPublishResult = {url, status, ...j};
+                    const j = JSON.parse(body);
+                    capture(source, {url, status, ...j});
                 } catch (e) {
-                    window.__xhsPublishResult = {url, status, raw: (bodyText || '').slice(0, 500)};
+                    // body 不是顶层 JSON，尝试 regex 抽取 code/msg
+                    const codeMatch = body.match(/"code":\\s*(-?\\d+)/);
+                    const msgMatch = body.match(/"msg":\\s*"([^"]+)"/);
+                    capture(source, {
+                        url, status,
+                        code: codeMatch ? parseInt(codeMatch[1], 10) : null,
+                        msg: msgMatch ? msgMatch[1] : null,
+                        raw: body.slice(0, 500),
+                    });
                 }
             }
 
-            // wrap XHR
+            // Layer 1: XHR — 内容标志判定，绕开 URL pattern 不可靠的问题
             const origOpen = XMLHttpRequest.prototype.open;
             const origSend = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(method, url) {
@@ -161,27 +178,70 @@ def click_publish_button(page: Page) -> None:
                 return origOpen.apply(this, arguments);
             };
             XMLHttpRequest.prototype.send = function() {
-                if (isPublishApi(this.__xhsPubUrl)) {
-                    this.addEventListener('loadend', () => {
-                        capture(this.__xhsPubUrl, this.status, this.responseText || '');
-                    });
-                }
+                this.addEventListener('loadend', () => {
+                    captureFromBody('xhr', this.__xhsPubUrl, this.status, this.responseText || '');
+                });
                 return origSend.apply(this, arguments);
             };
 
-            // wrap fetch (兜底)
+            // Layer 2: fetch — 同样内容判定
             const origFetch = window.fetch;
             window.fetch = async function(...args) {
                 const url = typeof args[0] === 'string' ? args[0] : args[0].url;
                 const resp = await origFetch.apply(this, args);
-                if (isPublishApi(url)) {
-                    try {
-                        const txt = await resp.clone().text();
-                        capture(url, resp.status, txt);
-                    } catch (e) {}
-                }
+                try {
+                    const txt = await resp.clone().text();
+                    captureFromBody('fetch', url, resp.status, txt);
+                } catch (e) {}
                 return resp;
             };
+
+            // Layer 3: console hook — XHS publish module 失败时打印 "[发布失败] HTTPBizError: ..."
+            ['error', 'log', 'warn'].forEach((method) => {
+                const orig = console[method];
+                console[method] = function(...args) {
+                    const txt = args.map((a) => {
+                        if (typeof a === 'string') return a;
+                        if (a && typeof a === 'object') {
+                            try { return JSON.stringify(a); } catch (e) { return String(a); }
+                        }
+                        return String(a);
+                    }).join(' ');
+                    if (txt.includes('HTTPBizError') || txt.includes('发布失败')) {
+                        const codeMatch = txt.match(/"code":\\s*(-?\\d+)/);
+                        const msgMatch = txt.match(/"msg":\\s*"([^"]+)"/);
+                        if (codeMatch) {
+                            capture('console', {
+                                code: parseInt(codeMatch[1], 10),
+                                msg: msgMatch ? msgMatch[1] : '发布失败',
+                                raw_console: txt.slice(0, 800),
+                            });
+                        }
+                    }
+                    return orig.apply(this, args);
+                };
+            });
+
+            // Layer 4: DOM MutationObserver — toast 出现"违反/违规/禁止发笔记"等关键词
+            const RISK_KW = /违反|违规|禁止发笔记|审核未通过|账号异常|无法发布/;
+            const obs = new MutationObserver((muts) => {
+                if (window.__xhsPublishResult) return;
+                muts.forEach((m) => {
+                    m.addedNodes.forEach((n) => {
+                        if (n.nodeType !== 1) return;
+                        const txt = (n.textContent || '').trim();
+                        if (txt.length === 0 || txt.length > 300) return;
+                        if (!RISK_KW.test(txt)) return;
+                        capture('toast', {
+                            code: -9136,  // 默认风控码
+                            msg: txt,
+                            cls: (n.className || '').toString().slice(0, 80),
+                        });
+                    });
+                });
+            });
+            obs.observe(document.body, {childList: true, subtree: true});
+            window.__xhsPublishObs = obs;
         })()
         """
     )
@@ -213,22 +273,31 @@ def click_publish_button(page: Page) -> None:
         time.sleep(0.3)
 
     if not result:
-        logger.warning("15s 内未捕获到发布 API 响应，无法确认发布是否成功")
+        logger.warning("15s 内未捕获到任何发布反馈（XHR/console/toast 都没匹配）")
         time.sleep(2)
         return
 
     # 4) 解析业务码
+    source = result.get("source", "unknown")
     code = result.get("code")
     msg = result.get("msg", "")
     success = result.get("success")
+    logger.info("捕获发布响应（来源=%s code=%s msg=%r）", source, code, msg)
 
     if code == 0 or success is True:
         logger.info("发布成功")
         time.sleep(2)
         return
 
-    if code == -9136:
-        raise AccountRiskControlError(code, msg or "因违反社区规范禁止发笔记")
+    # XHS 风控类业务码（-913x 段）+ 关键词兜底
+    is_risk_control = (
+        (code is not None and -9140 <= code <= -9130)
+        or "违反" in (msg or "")
+        or "禁止发笔记" in (msg or "")
+        or "违规" in (msg or "")
+    )
+    if is_risk_control:
+        raise AccountRiskControlError(code or -9136, msg or "账号被风控")
 
     raise PublishError(f"发布失败：code={code} msg={msg!r}")
 
