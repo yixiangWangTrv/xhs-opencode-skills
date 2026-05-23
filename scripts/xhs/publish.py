@@ -9,7 +9,13 @@ import re
 import time
 
 from .cdp import Page
-from .errors import ContentTooLongError, PublishError, TitleTooLongError, UploadTimeoutError
+from .errors import (
+    AccountRiskControlError,
+    ContentTooLongError,
+    PublishError,
+    TitleTooLongError,
+    UploadTimeoutError,
+)
 from .selectors import (
     CONTENT_EDITOR,
     CONTENT_LENGTH_ERROR,
@@ -108,35 +114,123 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
 
 
 def click_publish_button(page: Page) -> None:
-    """点击发布按钮。
+    """触发发布。
 
-    用文本内容精确匹配，避免点到旁边的"发布笔记"下拉按钮。
+    XHS 把发布/暂存按钮包成 <xhs-publish-btn> Vue web component + closed shadow DOM。
+    host 上挂着 'publish' 自定义事件 ——直接 dispatchEvent 比坐标点击 + CDP 真鼠标
+    更可靠：不依赖坐标、不依赖 chrome.debugger、不会被反爬的鼠标事件指纹检测。
+
+    流程：
+      1. 注入 fetch/XHR 拦截器捕获发布 API 响应
+      2. host.dispatchEvent(new CustomEvent('publish')) 触发发布
+      3. 轮询拦截结果，识别业务错误码（-9136 = 账号风控）
 
     Raises:
-        PublishError: 点击失败。
+        PublishError: 未找到 host 或按钮被禁用。
+        AccountRiskControlError: 账号被风控（如 code=-9136）。
     """
-    clicked = page.evaluate(
+    # 1) 注入响应拦截器（XHS 用 axios→XMLHttpRequest，必须 wrap XHR；fetch 兜底）
+    page.evaluate(
         """
         (() => {
-            // 找文本内容精确为"发布"的 bg-red 按钮（排除"发布笔记"等）
-            const btns = document.querySelectorAll('button.bg-red');
-            for (const btn of btns) {
-                const span = btn.querySelector('span');
-                const text = (span ? span.textContent : btn.textContent).trim();
-                if (text === '发布') {
-                    btn.scrollIntoView({block: 'center'});
-                    btn.click();
-                    return true;
+            window.__xhsPublishResult = null;
+
+            function isPublishApi(url) {
+                if (!url) return false;
+                return url.includes('/note/create')
+                    || url.includes('/publish/')
+                    || url.includes('publish_note')
+                    || url.includes('/note/post')
+                    || url.includes('/api/galaxy/');
+            }
+
+            function capture(url, status, bodyText) {
+                try {
+                    const j = JSON.parse(bodyText);
+                    window.__xhsPublishResult = {url, status, ...j};
+                } catch (e) {
+                    window.__xhsPublishResult = {url, status, raw: (bodyText || '').slice(0, 500)};
                 }
             }
-            return false;
+
+            // wrap XHR
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this.__xhsPubUrl = url;
+                return origOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function() {
+                if (isPublishApi(this.__xhsPubUrl)) {
+                    this.addEventListener('loadend', () => {
+                        capture(this.__xhsPubUrl, this.status, this.responseText || '');
+                    });
+                }
+                return origSend.apply(this, arguments);
+            };
+
+            // wrap fetch (兜底)
+            const origFetch = window.fetch;
+            window.fetch = async function(...args) {
+                const url = typeof args[0] === 'string' ? args[0] : args[0].url;
+                const resp = await origFetch.apply(this, args);
+                if (isPublishApi(url)) {
+                    try {
+                        const txt = await resp.clone().text();
+                        capture(url, resp.status, txt);
+                    } catch (e) {}
+                }
+                return resp;
+            };
         })()
         """
     )
-    if not clicked:
-        raise PublishError("未找到发布按钮")
-    time.sleep(3)
-    logger.info("发布完成")
+
+    # 2) dispatchEvent 触发发布
+    fire_result = page.evaluate(
+        """
+        (() => {
+            const host = document.querySelector('xhs-publish-btn[is-publish="true"]');
+            if (!host) return 'not_found';
+            if (host.getAttribute('submit-disabled') === 'true') return 'disabled';
+            host.dispatchEvent(new CustomEvent('publish', {bubbles: true, cancelable: true}));
+            return 'fired';
+        })()
+        """
+    )
+    if fire_result == "not_found":
+        raise PublishError("未找到 <xhs-publish-btn> 发布按钮容器")
+    if fire_result == "disabled":
+        raise PublishError("发布按钮 submit-disabled=true，不可发布")
+
+    # 3) 轮询等待 publish API 响应（15s 超时）
+    deadline = time.monotonic() + 15
+    result = None
+    while time.monotonic() < deadline:
+        result = page.evaluate("window.__xhsPublishResult")
+        if result:
+            break
+        time.sleep(0.3)
+
+    if not result:
+        logger.warning("15s 内未捕获到发布 API 响应，无法确认发布是否成功")
+        time.sleep(2)
+        return
+
+    # 4) 解析业务码
+    code = result.get("code")
+    msg = result.get("msg", "")
+    success = result.get("success")
+
+    if code == 0 or success is True:
+        logger.info("发布成功")
+        time.sleep(2)
+        return
+
+    if code == -9136:
+        raise AccountRiskControlError(code, msg or "因违反社区规范禁止发笔记")
+
+    raise PublishError(f"发布失败：code={code} msg={msg!r}")
 
 
 def save_as_draft(page: Page) -> None:
@@ -178,13 +272,19 @@ def _navigate_to_publish_page(page: Page) -> None:
 def _click_publish_tab(page: Page, tab_name: str) -> None:
     """点击发布页 TAB（上传图文/上传视频/写长文/发播客）。
 
-    XHS 创作中心反爬陷阱：
-    - 每个 tab 都有"真 + 假"两份。假 tab 有 data-hp-kind / button-hp-installed
-      属性（hp=honey pot），是反爬陷阱，点击会被标记为机器人 + active 不切换。
-    - 真 tab 是 Vue scoped 元素（data-v-* 属性，含 span.title 子元素），藏在
-      style="left: -9999px; top: -9999px;" 之外的位置，但 pointer-events: auto 可点。
+    XHS 创作中心反爬升级版 —— 每个 tab 渲染 3 份：
 
-    正确策略：只点没有 hp 标记的真 Vue tab，等待 active class 切换确认。
+    1. "屏外诱饵"：Vue scoped (data-v-*)，藏在 `left:-9999px; top:-9999px`，
+       看起来像真 tab 但**不绑事件**，点了 active 不切换。**没有 hp 属性**所以
+       老代码会把它当真 tab 误点。
+    2. "明显 honey pot"：带 data-hp-kind + button-hp-installed，
+       inset 在视口内但 opacity:1e-05 + z-index:-1，点了被标机器人。
+    3. **真 tab**：Vue scoped + 在视口内 + 带 **data-hp-bound="1"**
+       （XHS 反爬框架"已绑定真实事件"的标记）。
+
+    正确策略：找 `data-hp-bound="1"` 且无 hp 陷阱属性的 Vue tab；用 active class
+    切换确认。
+
     """
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -194,23 +294,27 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
                 const name = {json.dumps(tab_name)};
                 const tabs = document.querySelectorAll({json.dumps(CREATOR_TAB)});
 
-                // 优先策略：排除 honey pot，找真 Vue tab（含 span.title 且无 hp 标记）
+                // 真 tab：有 data-hp-bound + 无 hp 陷阱属性 + 在视口里
+                for (const t of tabs) {{
+                    if (t.hasAttribute('data-hp-kind') || t.hasAttribute('button-hp-installed')) continue;
+                    if (!t.hasAttribute('data-hp-bound')) continue;
+                    const title = t.querySelector('span.title');
+                    if (!title || title.textContent.trim() !== name) continue;
+                    const r = t.getBoundingClientRect();
+                    if (r.left < -1000 || r.top < -1000) continue;
+                    t.click();
+                    return 'clicked';
+                }}
+
+                // 兜底 1：无 hp 陷阱属性 + 在视口内（兼容 XHS 未来去掉 data-hp-bound）
                 for (const t of tabs) {{
                     if (t.hasAttribute('data-hp-kind') || t.hasAttribute('button-hp-installed')) continue;
                     const title = t.querySelector('span.title');
-                    if (title && title.textContent.trim() === name) {{
-                        t.click();
-                        return 'clicked';
-                    }}
-                }}
-
-                // 兜底：所有 tab 中按 span.title 匹配（含 hp 也接受，但仅当真 tab 都找不到时）
-                for (const t of tabs) {{
-                    const title = t.querySelector('span.title');
-                    if (title && title.textContent.trim() === name) {{
-                        t.click();
-                        return 'clicked';
-                    }}
+                    if (!title || title.textContent.trim() !== name) continue;
+                    const r = t.getBoundingClientRect();
+                    if (r.left < -1000 || r.top < -1000) continue;
+                    t.click();
+                    return 'clicked';
                 }}
 
                 return 'not_found';
@@ -218,29 +322,33 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
             """
         )
 
-        # 等待 active class 切换到目标 tab，确认真切换了（不是被 honey pot 吞了点击）
+        # 等待 active class 切换：检查真正 active 的 tab title 是否 == 目标
         if found == "clicked":
             switched_deadline = time.monotonic() + 5
             while time.monotonic() < switched_deadline:
-                is_active = page.evaluate(
+                active_title = page.evaluate(
                     f"""
                     (() => {{
+                        // 找视口内 + 无 hp 陷阱 + active 的 tab，取它的 title
                         const tabs = document.querySelectorAll({json.dumps(CREATOR_TAB)});
                         for (const t of tabs) {{
                             if (t.hasAttribute('data-hp-kind') || t.hasAttribute('button-hp-installed')) continue;
+                            if (!t.classList.contains('active')) continue;
+                            const r = t.getBoundingClientRect();
+                            if (r.left < -1000 || r.top < -1000) continue;
                             const title = t.querySelector('span.title');
-                            if (title && title.textContent.trim() === {json.dumps(tab_name)}) {{
-                                return t.classList.contains('active');
-                            }}
+                            return title ? title.textContent.trim() : null;
                         }}
-                        return false;
+                        return null;
                     }})()
                     """
                 )
-                if is_active:
+                if active_title == tab_name:
                     return
                 time.sleep(0.2)
-            logger.warning("点击了 %s 但 active class 未切换，可能被 honey pot 拦截", tab_name)
+            logger.warning(
+                "点击了 %s 但 active tab 仍是 %r，可能被反爬拦截", tab_name, active_title
+            )
 
         if found == "clicked":
             return

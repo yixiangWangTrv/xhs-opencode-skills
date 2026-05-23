@@ -822,6 +822,29 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ───────────────────────── 真实鼠标点击（chrome.debugger + CDP） ──────
 
+// 在视口绝对坐标 (x, y) 派发真实鼠标事件序列：mouseMoved（轨迹）+ mousePressed + mouseReleased。
+// 真事件走渲染层，能穿透 closed shadow DOM；JS 合成事件做不到。
+async function _dispatchRealClickAt(target, x, y) {
+  const startX = x - 20;
+  const startY = y - 45;
+  const steps = 5;
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: Math.round(startX + (x - startX) * t),
+      y: Math.round(startY + (y - startY) * t),
+      button: "none", buttons: 0, modifiers: 0,
+    });
+    await sleep(8);
+  }
+
+  const base = { x, y, button: "left", buttons: 1, clickCount: 1, modifiers: 0 };
+  await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { ...base, type: "mousePressed" });
+  await sleep(30);
+  await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased", buttons: 0 });
+}
+
 async function cmdClickViaDebugger(method, { selector, index, text }) {
   const tab = await getOrOpenXhsTab();
   const target = { tabId: tab.id };
@@ -836,6 +859,8 @@ async function cmdClickViaDebugger(method, { selector, index, text }) {
     findExpr = `document.querySelector(${JSON.stringify(selector)})`;
   }
 
+  // 防御性 detach：清掉残留 attach 状态
+  await chrome.debugger.detach(target).catch(() => {});
   await chrome.debugger.attach(target, "1.3");
   try {
     // 先滚动元素到视口中心，再取坐标
@@ -853,25 +878,7 @@ async function cmdClickViaDebugger(method, { selector, index, text }) {
     const pos = evalResult?.result?.value;
     if (!pos) throw new Error(`元素不存在: ${JSON.stringify({ selector, index, text })}`);
 
-    // 鼠标轨迹：从上方偏移处移动到目标点（5 步）
-    const startX = pos.x - 20;
-    const startY = pos.y - 45;
-    const steps = 5;
-    for (let i = 1; i <= steps; i++) {
-      const t = i / steps;
-      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-        type: "mouseMoved",
-        x: Math.round(startX + (pos.x - startX) * t),
-        y: Math.round(startY + (pos.y - startY) * t),
-        button: "none", buttons: 0, modifiers: 0,
-      });
-      await sleep(8);
-    }
-
-    const base = { x: pos.x, y: pos.y, button: "left", buttons: 1, clickCount: 1, modifiers: 0 };
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { ...base, type: "mousePressed" });
-    await sleep(30);
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased", buttons: 0 });
+    await _dispatchRealClickAt(target, pos.x, pos.y);
   } finally {
     await chrome.debugger.detach(target).catch(() => {});
   }
