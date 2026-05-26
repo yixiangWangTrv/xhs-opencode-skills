@@ -1,3 +1,6 @@
+# 来源
+来自于https://github.com/yixiangWangTrv/xhs-opencode-skills，在这个基础上提升了防风控措施
+
 # xiaohongshu-skills
 
 小红书自动化 Skills，直接使用你已登录的浏览器和真实账号，以普通用户的方式操作小红书。
