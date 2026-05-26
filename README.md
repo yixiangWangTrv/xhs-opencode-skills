@@ -1,5 +1,5 @@
 # 来源
-来自于https://github.com/yixiangWangTrv/xhs-opencode-skills
+来自于https://github.com/autoclaw-cc/xiaohongshu-skills
 在这个基础上提升了防风控措施
 
 # xiaohongshu-skills
